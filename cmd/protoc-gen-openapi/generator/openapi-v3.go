@@ -40,6 +40,13 @@ type Configuration struct {
 	CircularDepth *int
 }
 
+// Schema from a Message with modified name and/or fields
+type ModifiedSchema struct {
+	Name            string
+	Message         *protogen.Message
+	FieldNames      []string
+}
+
 const (
 	infoURL           = "https://github.com/google/gnostic/tree/master/cmd/protoc-gen-openapi"
 	protobufValueName = "AnyJSONValue"
@@ -50,6 +57,7 @@ type OpenAPIv3Generator struct {
 	conf   Configuration
 	plugin *protogen.Plugin
 
+	modifiedSchemas   []ModifiedSchema
 	requiredSchemas   []string // Names of schemas that need to be generated.
 	generatedSchemas  []string // Names of schemas that have already been generated.
 	linterRulePattern *regexp.Regexp
@@ -125,6 +133,10 @@ func (g *OpenAPIv3Generator) buildDocumentV3() *v3.Document {
 			g.addSchemasToDocumentV3(d, file.Messages)
 		}
 		g.requiredSchemas = g.requiredSchemas[count:len(g.requiredSchemas)]
+	}
+
+	for _, schema := range g.modifiedSchemas {
+		g.addSchemaToDocumentV3(d, schema.Message, schema.Name, schema.FieldNames)
 	}
 
 	allServers := []string{}
@@ -276,7 +288,7 @@ func (g *OpenAPIv3Generator) addPathsToDocumentV3(d *v3.Document, file *protogen
 				defaultHost := proto.GetExtension(service.Desc.Options(), annotations.E_DefaultHost).(string)
 
 				op, path2 := g.buildOperationV3(
-					file, operationID, service.GoName, comment, defaultHost, path, body, inputMessage, outputMessage)
+					file, operationID, service.GoName, method.GoName, comment, defaultHost, path, body, inputMessage, outputMessage)
 				g.addOperationV3(d, op, path2, methodName)
 			}
 		}
@@ -470,6 +482,7 @@ func (g *OpenAPIv3Generator) buildOperationV3(
 	file *protogen.File,
 	operationID string,
 	tagName string,
+	methodName string,
 	description string,
 	defaultHost string,
 	path string,
@@ -623,10 +636,27 @@ func (g *OpenAPIv3Generator) buildOperationV3(
 		var requestSchema *v3.SchemaOrReference
 
 		if bodyField == "*" {
-			// Pass the entire request message as the request body.
-			typeName := fullMessageTypeName(inputMessage.Desc)
-			requestSchema = g.schemaOrReferenceForType(typeName)
+			if string(inputMessage.Desc.FullName()) != "google.api.HttpBody" && haveCommonItem(coveredParameters, g.getMessageFieldNames(inputMessage)) {
+				// Add a new modified schema with fields that are not covered by path parameters
+				schema := ModifiedSchema{}
+				for _, field := range inputMessage.Fields {
+					fieldName := string(field.Desc.Name())
+					if !contains(coveredParameters, fieldName) {
+						schema.FieldNames = append(schema.FieldNames, fieldName)
+					}
+				}
+				schema.Name = methodName + "RequestBody"
+				schema.Message = inputMessage
+				g.modifiedSchemas = append(g.modifiedSchemas, schema)
 
+				// Pass it as the request body.
+				typeName := schema.Name
+				requestSchema = g.schemaOrReferenceForType(typeName)
+			} else {
+				// Pass the entire request message as the request body.
+				typeName := fullMessageTypeName(inputMessage.Desc)
+				requestSchema = g.schemaOrReferenceForType(typeName)
+			}
 		} else {
 			// If body refers to a message field, use that type.
 			for _, field := range inputMessage.Fields {
@@ -892,6 +922,146 @@ func (g *OpenAPIv3Generator) schemaOrReferenceForField(field protoreflect.FieldD
 	return kindSchema
 }
 
+// addSchemaToDocumentV3 adds a single schema
+func (g *OpenAPIv3Generator) addSchemaToDocumentV3(d *v3.Document, message *protogen.Message, name string, fieldNames []string) {
+	// google.protobuf.Value is handled like a special value when doing transcoding.
+	// It's interpreted as a "catch all" JSON value, that can be anything.
+	if message.Desc != nil && message.Desc.FullName() == "google.protobuf.Value" {
+		// Add the schema to the components.schema list.
+		description := protobufValueName + ` is a "catch all" type that can hold any JSON value, except null as this is not allowed in OpenAPI`
+
+		d.Components.Schemas.AdditionalProperties = append(d.Components.Schemas.AdditionalProperties,
+			&v3.NamedSchemaOrReference{
+				Name: protobufValueName,
+				Value: &v3.SchemaOrReference{
+					Oneof: &v3.SchemaOrReference_Schema{
+						Schema: &v3.Schema{
+							Description: description,
+							OneOf: []*v3.SchemaOrReference{
+								// type is not allow to be null in OpenAPI
+								{
+									Oneof: &v3.SchemaOrReference_Schema{
+										Schema: &v3.Schema{Type: "string"},
+									},
+								}, {
+									Oneof: &v3.SchemaOrReference_Schema{
+										Schema: &v3.Schema{Type: "number"},
+									},
+								}, {
+									Oneof: &v3.SchemaOrReference_Schema{
+										Schema: &v3.Schema{Type: "integer"},
+									},
+								}, {
+									Oneof: &v3.SchemaOrReference_Schema{
+										Schema: &v3.Schema{Type: "boolean"},
+									},
+								}, {
+									Oneof: &v3.SchemaOrReference_Schema{
+										Schema: &v3.Schema{Type: "object"},
+									},
+								}, {
+									Oneof: &v3.SchemaOrReference_Schema{
+										Schema: &v3.Schema{
+											Type: "array",
+											Items: &v3.ItemsItem{
+												SchemaOrReference: []*v3.SchemaOrReference{{
+													Oneof: &v3.SchemaOrReference_Reference{
+														Reference: &v3.Reference{XRef: "#/components/schemas/" + protobufValueName},
+													},
+												}},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		)
+		return
+	}
+
+	// Get the message description from the comments.
+	messageDescription := g.filterCommentString(message.Comments.Leading, true)
+
+	// Build an array holding the fields of the message.
+	definitionProperties := &v3.Properties{
+		AdditionalProperties: make([]*v3.NamedSchemaOrReference, 0),
+	}
+
+	var required []string
+	for _, field := range message.Fields {
+		// If the name is not in fieldNames, we don't need this field
+		if (!contains(fieldNames, string(field.Desc.Name()))) {
+			continue
+		}
+
+		// Check the field annotations to see if this is a readonly or writeonly field.
+		inputOnly := false
+		outputOnly := false
+		extension := proto.GetExtension(field.Desc.Options(), annotations.E_FieldBehavior)
+		if extension != nil {
+			switch v := extension.(type) {
+			case []annotations.FieldBehavior:
+				for _, vv := range v {
+					switch vv {
+					case annotations.FieldBehavior_OUTPUT_ONLY:
+						outputOnly = true
+					case annotations.FieldBehavior_INPUT_ONLY:
+						inputOnly = true
+					case annotations.FieldBehavior_REQUIRED:
+						required = append(required, g.formatFieldName(field))
+					}
+				}
+			default:
+				log.Printf("unsupported extension type %T", extension)
+			}
+		}
+
+		// The field is either described by a reference or a schema.
+		fieldSchema := g.schemaOrReferenceForField(field.Desc)
+		if fieldSchema == nil {
+			continue
+		}
+
+		if schema, ok := fieldSchema.Oneof.(*v3.SchemaOrReference_Schema); ok {
+			// Get the field description from the comments.
+			schema.Schema.Description = g.filterCommentString(field.Comments.Leading, true)
+			if outputOnly {
+				schema.Schema.ReadOnly = true
+			}
+			if inputOnly {
+				schema.Schema.WriteOnly = true
+			}
+		}
+
+		definitionProperties.AdditionalProperties = append(
+			definitionProperties.AdditionalProperties,
+			&v3.NamedSchemaOrReference{
+				Name:  g.formatFieldName(field),
+				Value: fieldSchema,
+			},
+		)
+	}
+	// Add the schema to the components.schema list.
+	d.Components.Schemas.AdditionalProperties = append(d.Components.Schemas.AdditionalProperties,
+		&v3.NamedSchemaOrReference{
+			Name: name,
+			Value: &v3.SchemaOrReference{
+				Oneof: &v3.SchemaOrReference_Schema{
+					Schema: &v3.Schema{
+						Type:        "object",
+						Description: messageDescription,
+						Properties:  definitionProperties,
+						Required:    required,
+					},
+				},
+			},
+		},
+	)
+}
+
 // addSchemasToDocumentV3 adds info from one file descriptor.
 func (g *OpenAPIv3Generator) addSchemasToDocumentV3(d *v3.Document, messages []*protogen.Message) {
 	// For each message, generate a definition.
@@ -910,138 +1080,27 @@ func (g *OpenAPIv3Generator) addSchemasToDocumentV3(d *v3.Document, messages []*
 
 		g.generatedSchemas = append(g.generatedSchemas, typeName)
 
-		// google.protobuf.Value is handled like a special value when doing transcoding.
-		// It's interpreted as a "catch all" JSON value, that can be anything.
-		if message.Desc != nil && message.Desc.FullName() == "google.protobuf.Value" {
-			// Add the schema to the components.schema list.
-			description := protobufValueName + ` is a "catch all" type that can hold any JSON value, except null as this is not allowed in OpenAPI`
-
-			d.Components.Schemas.AdditionalProperties = append(d.Components.Schemas.AdditionalProperties,
-				&v3.NamedSchemaOrReference{
-					Name: protobufValueName,
-					Value: &v3.SchemaOrReference{
-						Oneof: &v3.SchemaOrReference_Schema{
-							Schema: &v3.Schema{
-								Description: description,
-								OneOf: []*v3.SchemaOrReference{
-									// type is not allow to be null in OpenAPI
-									{
-										Oneof: &v3.SchemaOrReference_Schema{
-											Schema: &v3.Schema{Type: "string"},
-										},
-									}, {
-										Oneof: &v3.SchemaOrReference_Schema{
-											Schema: &v3.Schema{Type: "number"},
-										},
-									}, {
-										Oneof: &v3.SchemaOrReference_Schema{
-											Schema: &v3.Schema{Type: "integer"},
-										},
-									}, {
-										Oneof: &v3.SchemaOrReference_Schema{
-											Schema: &v3.Schema{Type: "boolean"},
-										},
-									}, {
-										Oneof: &v3.SchemaOrReference_Schema{
-											Schema: &v3.Schema{Type: "object"},
-										},
-									}, {
-										Oneof: &v3.SchemaOrReference_Schema{
-											Schema: &v3.Schema{
-												Type: "array",
-												Items: &v3.ItemsItem{
-													SchemaOrReference: []*v3.SchemaOrReference{{
-														Oneof: &v3.SchemaOrReference_Reference{
-															Reference: &v3.Reference{XRef: "#/components/schemas/" + protobufValueName},
-														},
-													}},
-												},
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			)
-			continue
-		}
-
-		// Get the message description from the comments.
-		messageDescription := g.filterCommentString(message.Comments.Leading, true)
-
-		// Build an array holding the fields of the message.
-		definitionProperties := &v3.Properties{
-			AdditionalProperties: make([]*v3.NamedSchemaOrReference, 0),
-		}
-
-		var required []string
-		for _, field := range message.Fields {
-			// Check the field annotations to see if this is a readonly or writeonly field.
-			inputOnly := false
-			outputOnly := false
-			extension := proto.GetExtension(field.Desc.Options(), annotations.E_FieldBehavior)
-			if extension != nil {
-				switch v := extension.(type) {
-				case []annotations.FieldBehavior:
-					for _, vv := range v {
-						switch vv {
-						case annotations.FieldBehavior_OUTPUT_ONLY:
-							outputOnly = true
-						case annotations.FieldBehavior_INPUT_ONLY:
-							inputOnly = true
-						case annotations.FieldBehavior_REQUIRED:
-							required = append(required, g.formatFieldName(field))
-						}
-					}
-				default:
-					log.Printf("unsupported extension type %T", extension)
-				}
-			}
-
-			// The field is either described by a reference or a schema.
-			fieldSchema := g.schemaOrReferenceForField(field.Desc)
-			if fieldSchema == nil {
-				continue
-			}
-
-			if schema, ok := fieldSchema.Oneof.(*v3.SchemaOrReference_Schema); ok {
-				// Get the field description from the comments.
-				schema.Schema.Description = g.filterCommentString(field.Comments.Leading, true)
-				if outputOnly {
-					schema.Schema.ReadOnly = true
-				}
-				if inputOnly {
-					schema.Schema.WriteOnly = true
-				}
-			}
-
-			definitionProperties.AdditionalProperties = append(
-				definitionProperties.AdditionalProperties,
-				&v3.NamedSchemaOrReference{
-					Name:  g.formatFieldName(field),
-					Value: fieldSchema,
-				},
-			)
-		}
-		// Add the schema to the components.schema list.
-		d.Components.Schemas.AdditionalProperties = append(d.Components.Schemas.AdditionalProperties,
-			&v3.NamedSchemaOrReference{
-				Name: g.formatMessageName(message),
-				Value: &v3.SchemaOrReference{
-					Oneof: &v3.SchemaOrReference_Schema{
-						Schema: &v3.Schema{
-							Type:        "object",
-							Description: messageDescription,
-							Properties:  definitionProperties,
-							Required:    required,
-						},
-					},
-				},
-			},
-		)
+		g.addSchemaToDocumentV3(d, message, g.formatMessageName(message), g.getMessageFieldNames(message))
 	}
+}
+
+// getMessageFieldNames gets the names of all fields from a message
+func (g *OpenAPIv3Generator) getMessageFieldNames(message *protogen.Message) []string {
+	fieldNames := []string{}
+	for _, field := range message.Fields {
+		fieldNames = append(fieldNames, string(field.Desc.Name()))
+	}
+	return fieldNames
+}
+
+// haveCommonItem returns true if 2 string arrays have a common item
+func haveCommonItem(a1 []string, a2 []string) bool {
+	for _, item := range a1 {
+		if contains(a2, item) {
+			return true
+		}
+	}
+	return false
 }
 
 // contains returns true if an array contains a specified string.
