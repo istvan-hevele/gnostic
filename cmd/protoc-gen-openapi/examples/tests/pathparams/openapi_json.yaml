@@ -43,7 +43,7 @@ paths:
                 content:
                     application/json:
                         schema:
-                            $ref: '#/components/schemas/Message'
+                            $ref: '#/components/schemas/CreateMessageRequestBody'
                 required: true
             responses:
                 "200":
@@ -78,6 +78,16 @@ paths:
                                 $ref: '#/components/schemas/Message'
 components:
     schemas:
+        CreateMessageRequestBody:
+            type: object
+            properties:
+                userId:
+                    type: integer
+                    format: uint64
+                content:
+                    type: string
+                maybe:
+                    type: string
         Message:
             type: object
             properties:

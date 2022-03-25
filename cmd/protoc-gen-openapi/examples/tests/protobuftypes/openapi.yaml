@@ -113,7 +113,7 @@ paths:
                 content:
                     application/json:
                         schema:
-                            $ref: '#/components/schemas/Message'
+                            $ref: '#/components/schemas/CreateMessageRequestBody'
                 required: true
             responses:
                 "200":
@@ -247,6 +247,46 @@ components:
                   items:
                     $ref: '#/components/schemas/AnyJSONValue'
             description: AnyJSONValue is a "catch all" type that can hold any JSON value, except null as this is not allowed in OpenAPI
+        CreateMessageRequestBody:
+            type: object
+            properties:
+                string_type:
+                    type: string
+                recursive_type:
+                    $ref: '#/components/schemas/RecursiveParent'
+                embedded_type:
+                    $ref: '#/components/schemas/Message_EmbMessage'
+                sub_type:
+                    $ref: '#/components/schemas/SubMessage'
+                repeated_type:
+                    type: array
+                    items:
+                        type: string
+                repeated_sub_type:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/SubMessage'
+                repeated_recursive_type:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/RecursiveParent'
+                map_type:
+                    type: object
+                    additionalProperties:
+                        type: string
+                body:
+                    type: object
+                media:
+                    type: array
+                    items:
+                        type: object
+                value_type:
+                    $ref: '#/components/schemas/AnyJSONValue'
+                repeated_value_type:
+                    type: array
+                    items:
+                        $ref: '#/components/schemas/AnyJSONValue'
+                    description: Description of repeated value
         Message:
             type: object
             properties:
